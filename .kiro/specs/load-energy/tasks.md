@@ -283,7 +283,7 @@ Every one of the 39 correctness properties in `design.md` has exactly one proper
     - Manifest validity and service worker registration; the New Request form renders gallons, product, method, pin, and window inputs; the geolocation default pin with a mocked geolocation source.
     - _Requirements: 15.1, 15.2, 15.3_
 
-- [ ] 15. Final checkpoint — full two-sided flow integrated
+- [x] 15. Final checkpoint — full two-sided flow integrated
   - Ensure all tests pass, ask the user if questions arise.
 
 ## Notes
