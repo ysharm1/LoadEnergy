@@ -1,0 +1,318 @@
+// Load Energy — Prisma schema.
+// Mirrors the Data Models section of design.md. PostgreSQL-backed.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum CompanyKind {
+  buyer
+  supplier
+}
+
+enum SupplierApprovalStatus {
+  pending
+  approved
+}
+
+enum SupplierStatus {
+  open
+  limited
+  closed
+}
+
+enum Role {
+  buyer
+  supplier
+  admin
+}
+
+enum ProductType {
+  ulsd
+  dyed
+}
+
+enum DeliveryMethod {
+  wet_hose
+  yard_tank
+}
+
+enum DeliveryWindow {
+  today
+  tomorrow_am
+}
+
+// Four-state request model: Orders come from acceptance (or concierge);
+// there is no Quoted state.
+enum RequestStatus {
+  open
+  accepted
+  cancelled
+  expired
+}
+
+enum OfferStatus {
+  active
+  accepted
+  voided
+  expired
+}
+
+enum OrderStatus {
+  accepted
+  en_route
+  delivered
+}
+
+enum PaymentStatus {
+  unpaid
+  paid
+}
+
+// The full set of audited actions (Requirement 14.1-14.6, 17.4).
+enum AuditAction {
+  OFFER_SUBMITTED
+  OFFER_ACCEPTED
+  REQUEST_CANCELLED
+  REQUEST_EXPIRED
+  STATUS_CHANGED
+  CONCIERGE_CREATED
+  INVOICE_PAID
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+model Company {
+  id   String      @id @default(uuid())
+  name String
+  kind CompanyKind
+
+  // Supplier-only fields; null for buyer companies.
+  // operatingLat/Lng and serviceRadiusMiles are Admin-set and are the
+  // origin/radius used for RFQ radius matching.
+  supplierApprovalStatus SupplierApprovalStatus?
+  supplierStatus         SupplierStatus?
+  operatingLat           Float?
+  operatingLng           Float?
+  serviceRadiusMiles     Float?
+
+  users              User[]
+  sites              Site[]
+  requests           Request[]           @relation("BuyerCompanyRequests")
+  offers             Offer[]             @relation("SupplierCompanyOffers")
+  buyerOrders        Order[]             @relation("BuyerCompanyOrders")
+  supplierOrders     Order[]             @relation("SupplierCompanyOrders")
+  commissionInvoices CommissionInvoice[]
+
+  createdAt DateTime @default(now())
+}
+
+model User {
+  id        String @id @default(uuid())
+  companyId String
+  role      Role
+
+  // phone is required and stored in E.164 (or equivalent) form; email is
+  // optional. Both are unique identifiers when present.
+  phone        String  @unique
+  email        String? @unique
+  passwordHash String
+
+  company            Company             @relation(fields: [companyId], references: [id])
+  requests           Request[]
+  offers             Offer[]
+  auditEntries       AuditEntry[]
+  paidInvoices       CommissionInvoice[] @relation("InvoicePaidByAdmin")
+  geofencesConfigured PilotGeofence[]
+  sessions           Session[]
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId])
+}
+
+// Server-side session state (Requirement 1.1). The client holds only the
+// opaque token in an HTTP-only cookie; the stored value is the SHA-256 hash of
+// that token, so a table dump cannot be replayed as a live session. Role and
+// company are deliberately absent — AuthContext is resolved from the User row
+// on each request rather than frozen into the session.
+model Session {
+  id        String   @id @default(uuid())
+  tokenHash String   @unique
+  userId    String
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Site {
+  id        String @id @default(uuid())
+  companyId String
+  name      String
+  lat       Float
+  lng       Float
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId])
+}
+
+model Request {
+  id              String         @id @default(uuid())
+  buyerCompanyId  String
+  createdByUserId String
+  gallons         Int
+  productType     ProductType
+  deliveryMethod  DeliveryMethod
+  deliveryWindow  DeliveryWindow
+  pinLat          Float
+  pinLng          Float
+  notes           String?
+  status          RequestStatus  @default(open)
+  // Derived from deliveryWindow; drives window-end expiry.
+  windowEndsAt    DateTime
+  createdAt       DateTime       @default(now())
+
+  buyerCompany Company @relation("BuyerCompanyRequests", fields: [buyerCompanyId], references: [id])
+  createdBy    User    @relation(fields: [createdByUserId], references: [id])
+  offers       Offer[]
+  order        Order?
+
+  @@index([buyerCompanyId])
+  @@index([status])
+}
+
+model Offer {
+  id                String      @id @default(uuid())
+  requestId         String
+  supplierCompanyId String
+  createdByUserId   String
+  landedPricePerGal Decimal     @db.Decimal(10, 4)
+  // Constrained to the inclusive range 1..8 at the service layer.
+  holdHours         Int
+  etaMinutes        Int?
+  createdAt         DateTime    @default(now())
+  expiresAt         DateTime
+  voided            Boolean     @default(false)
+  status            OfferStatus @default(active)
+
+  request         Request @relation(fields: [requestId], references: [id])
+  supplierCompany Company @relation("SupplierCompanyOffers", fields: [supplierCompanyId], references: [id])
+  createdBy       User    @relation(fields: [createdByUserId], references: [id])
+  order           Order?
+
+  @@index([requestId])
+  @@index([supplierCompanyId])
+}
+
+model Order {
+  id String @id @default(uuid())
+
+  // Null on the concierge path: an Admin-entered off-app deal has no
+  // originating Request or winning Offer. Unique on the app path so a
+  // Request yields at most one Order and an Offer wins at most once.
+  requestId String? @unique
+  offerId   String? @unique
+
+  buyerCompanyId    String
+  supplierCompanyId String
+  status            OrderStatus @default(accepted)
+  isConcierge       Boolean     @default(false)
+  createdAt         DateTime    @default(now())
+
+  request           Request?           @relation(fields: [requestId], references: [id])
+  offer             Offer?             @relation(fields: [offerId], references: [id])
+  buyerCompany      Company            @relation("BuyerCompanyOrders", fields: [buyerCompanyId], references: [id])
+  supplierCompany   Company            @relation("SupplierCompanyOrders", fields: [supplierCompanyId], references: [id])
+  delivery          Delivery?
+  commissionInvoice CommissionInvoice?
+
+  @@index([buyerCompanyId])
+  @@index([supplierCompanyId])
+}
+
+model Delivery {
+  id String @id @default(uuid())
+  // Unique: at most one Delivery per Order.
+  orderId        String   @unique
+  bolGallons     Int
+  // Required on the supplier-recorded path (Requirement 11.5); nullable only
+  // because an Admin concierge entry may have no ticket on file
+  // (Requirement 17.2).
+  ticketNumber   String?
+  ticketPhotoKey String?
+  deliveredAt    DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id])
+}
+
+model CommissionInvoice {
+  id String @id @default(uuid())
+  // Unique: exactly one invoice per Delivered Order (guards idempotency).
+  orderId           String        @unique
+  supplierCompanyId String
+  bolGallons        Int
+  amount            Decimal       @db.Decimal(12, 4)
+  // True for the supplier company's first two completed wins (amount 0).
+  waived            Boolean       @default(false)
+  paymentStatus     PaymentStatus @default(unpaid)
+  // Set when an Admin marks the invoice paid.
+  paidByAdminId     String?
+  paidAt            DateTime?
+  createdAt         DateTime      @default(now())
+
+  order           Order   @relation(fields: [orderId], references: [id])
+  supplierCompany Company @relation(fields: [supplierCompanyId], references: [id])
+  paidByAdmin     User?   @relation("InvoicePaidByAdmin", fields: [paidByAdminId], references: [id])
+
+  @@index([supplierCompanyId])
+  @@index([paymentStatus])
+}
+
+// Append-only. The persistence surface exposes insert and read only — no
+// update or delete path (Requirement 14.7).
+model AuditEntry {
+  id String @id @default(uuid())
+  // Nullable: system-driven request expiry has no acting User.
+  actorUserId String?
+  action      AuditAction
+  subjectId   String
+  // Entity ids and prior/new values where relevant.
+  payload     Json?
+  createdAt   DateTime    @default(now())
+
+  actor User? @relation(fields: [actorUserId], references: [id])
+
+  @@index([subjectId])
+  @@index([action])
+}
+
+// Single Admin-configured bounding box applied to newly created Requests.
+model PilotGeofence {
+  id           String   @id @default(uuid())
+  minLat       Float
+  maxLat       Float
+  minLng       Float
+  maxLng       Float
+  setByAdminId String
+  updatedAt    DateTime @updatedAt
+
+  setByAdmin User @relation(fields: [setByAdminId], references: [id])
+}

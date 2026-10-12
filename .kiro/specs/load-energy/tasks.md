@@ -1,0 +1,297 @@
+# Implementation Plan: Load Energy
+
+## Overview
+
+This plan builds the full locked v1.0 scope of Load Energy as a mobile-first Next.js (App Router) PWA in TypeScript over PostgreSQL/Prisma, with all marketplace logic in a pure service layer over an injectable repository so it can be property-tested with `fast-check` against an in-memory store. Twilio carries SMS, email is optional, and S3 holds BOL ticket photos.
+
+Task order follows the locked build sequence: auth/company/user with required phone and roles, then admin approval + operating pin + radius + geofence, then request creation with geofence and radius matching plus SMS, then offers with the 1–8 hour hold and acceptance, then request cancel/expire, then en-route/delivery/BOL, then commission with waived wins and mark-paid, then concierge plus the audit log, and the PWA field UI last. Each step builds on the previous and ends wired in — no orphaned code.
+
+Every one of the 39 correctness properties in `design.md` has exactly one property-test sub-task, placed next to the code it validates. All tasks are required.
+
+## Tasks
+
+- [x] 1. Project scaffold, schema, and domain types
+  - [x] 1.1 Initialize the project and test harness
+    - Create the Next.js (App Router, TypeScript) project with PWA manifest and service worker registration, configure PostgreSQL + Prisma, and set up Vitest with `fast-check` (default `numRuns: 100`).
+    - _Requirements: 15.1_
+  - [x] 1.2 Define the Prisma schema and shared domain types
+    - Model Company (kind, supplierApprovalStatus, supplierStatus, operatingLat/Lng, serviceRadiusMiles), User (companyId, role, required phone, optional email, passwordHash), Site, Request (four-state status, windowEndsAt), Offer (holdHours, expiresAt, voided, status), Order (status, isConcierge), Delivery (unique orderId), CommissionInvoice (unique orderId, amount, waived, paymentStatus, paidByAdminId, paidAt), AuditEntry, and PilotGeofence per the Data Models section.
+    - Define TypeScript enums for Role, Request_Status (Open/Accepted/Cancelled/Expired), Product_Type, Delivery_Method, Delivery_Window, Supplier_Status, Order_Status (Accepted/En_Route/Delivered), Payment_Status, and the AuditAction union.
+    - Define the injectable `Repository` interface plus an in-memory implementation for property tests, and the shared error taxonomy (validation, geofence, authentication, authorization, conflict).
+    - _Requirements: 1.3, 1.4, 3.1, 5.1, 10.1, 12.4, 14.7_
+
+- [x] 2. Auth, Company, User with required phone, and roles
+  - [x] 2.1 Implement credential authentication and session resolution
+    - Verify credentials, issue an HTTP-only session cookie, and resolve `AuthContext { userId, companyId, role }` on protected paths; reject invalid credentials with an authentication error.
+    - _Requirements: 1.1, 1.2_
+  - [x] 2.2 Implement Company and User creation with a required E.164 phone
+    - Link every User to exactly one Company and exactly one role; require a non-empty E.164-form phone and reject creation without one as a validation error; store email when supplied.
+    - _Requirements: 1.3, 1.4, 1.5, 1.6, 1.7_
+  - [x] 2.3 Implement the role and company authorization guard used by every service
+    - A single guard that services call to assert role and owning-company scope, returning an authorization error on violation; role-appropriate interface selection on session read.
+    - _Requirements: 1.8, 1.9_
+  - [x] 2.4 Write property test for the User round trip
+    - **Property 1: User round trip with required phone and optional email**
+    - **Validates: Requirements 1.3, 1.4, 1.5, 1.7**
+  - [x] 2.5 Write property test for the phone requirement
+    - **Property 2: User creation requires a phone**
+    - **Validates: Requirements 1.6**
+  - [x] 2.6 Write unit tests for login success and invalid-credential rejection
+    - A valid credential pair establishes a session; an invalid pair returns an authentication error.
+    - _Requirements: 1.1, 1.2_
+
+- [x] 3. Admin approval, operating pin, service radius, and pilot geofence
+  - [x] 3.1 Implement supplier approval lifecycle
+    - New Supplier Companies are created Pending; `approveSupplier` sets Approved. Admin-only. License verification stays an offline ADOT process with no system check.
+    - _Requirements: 16.1, 16.2_
+  - [x] 3.2 Implement Operating_Location and Service_Radius configuration
+    - `setOperatingLocation` and `setServiceRadius` persist on the Supplier Company; reject a radius less than or equal to zero with a validation error. Admin-only.
+    - _Requirements: 16.4, 16.5, 16.6_
+  - [x] 3.3 Implement Pilot_Geofence configuration
+    - `setGeofence` persists the bounding box as the single Admin config and exposes it for use by new Request creation.
+    - _Requirements: 16.7_
+  - [x] 3.4 Write property test for the admin approval and configuration lifecycle
+    - **Property 37: Admin approval and configuration lifecycle**
+    - **Validates: Requirements 16.1, 16.2, 16.4, 16.5, 16.7**
+  - [x] 3.5 Write property test for non-positive radius rejection
+    - **Property 38: Non-positive radius rejected**
+    - **Validates: Requirements 16.6**
+
+- [x] 4. Buyer sites and Request creation behind the geofence
+  - [x] 4.1 Implement Site creation and listing
+    - Create Sites on the caller's Buyer Company storing latitude/longitude; reject latitude outside [-90, 90] or longitude outside [-180, 180]; scope listing to the caller's Company.
+    - _Requirements: 2.1, 2.2, 2.3, 2.4_
+  - [x] 4.2 Implement the geofence bounding-box check
+    - `isInsideGeofence(pin, fence)` with inclusive bounds, reading the Admin-configured fence from task 3.3.
+    - _Requirements: 16.7_
+  - [x] 4.3 Implement Request creation and the buyer work list
+    - Validate gallons greater than zero and the Product_Type / Delivery_Method / Delivery_Window enums, reject pins outside the Pilot_Geofence with a geofence error, store optional notes, derive `windowEndsAt` from the window, set status Open, and link the creating Buyer and Company. The buyer work list returns that Company's Open Requests and Orders.
+    - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9_
+  - [x] 4.4 Write property test for Site round trip and tenant isolation
+    - **Property 3: Site round trip and tenant isolation**
+    - **Validates: Requirements 2.1, 2.2, 2.3, 3.9**
+  - [x] 4.5 Write property test for coordinate validation
+    - **Property 4: Coordinate validation rejects out-of-range pins**
+    - **Validates: Requirements 2.4**
+  - [x] 4.6 Write property test for the Request round trip
+    - **Property 5: Request round trip with valid enums**
+    - **Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.7, 3.8**
+  - [x] 4.7 Write property test for non-positive gallons rejection
+    - **Property 6: Non-positive gallons rejected**
+    - **Validates: Requirements 3.5**
+  - [x] 4.8 Write property test for geofence-governed Request acceptance
+    - **Property 7: Geofence membership governs Request acceptance**
+    - **Validates: Requirements 3.6, 16.7**
+
+- [x] 5. Supplier availability, radius matching, and RFQ notifications
+  - [x] 5.1 Implement great-circle distance and the radius check
+    - `haversineMiles(a, b)` and `isWithinRadius(pin, operatingLocation, radiusMiles)` as pure functions.
+    - _Requirements: 4.2_
+  - [x] 5.2 Implement Supplier_Status read and write
+    - Persist Open / Limited / Closed on the Supplier Company immediately on change.
+    - _Requirements: 5.1, 5.2_
+  - [x] 5.3 Implement the matching predicate and the supplier RFQ inbox
+    - `matchSuppliers` admits a Supplier Company only when it is Approved, its Supplier_Status is Open or Limited, the Request pin is within its Admin-configured Service_Radius of its Operating_Location, and the Request_Status is Open; the inbox query returns exactly those Requests, excluding out-of-radius, Pending, Closed, Accepted, Cancelled, and Expired cases.
+    - _Requirements: 4.1, 4.3, 4.4, 4.5, 4.6, 4.7, 5.3, 9.4, 16.3_
+  - [x] 5.4 Implement the notification dispatcher and wire the NEW_RFQ event
+    - Send SMS via Twilio to every recipient and additionally email where an address is on file; isolate per-recipient and per-channel failures by recording them and continuing without throwing. Fire NEW_RFQ to each matched Supplier on Request creation.
+    - _Requirements: 13.1, 13.5, 13.6, 13.7_
+  - [x] 5.5 Write property test for great-circle distance
+    - **Property 8: Haversine distance is well-formed**
+    - **Validates: Requirements 4.2**
+  - [x] 5.6 Write property test for the supplier matching predicate
+    - **Property 9: Supplier matching predicate**
+    - **Validates: Requirements 4.1, 4.3, 4.4, 4.5, 4.6, 4.7, 5.3, 9.4, 16.3**
+  - [x] 5.7 Write property test for supplier status persistence
+    - **Property 10: Supplier status persistence round trip**
+    - **Validates: Requirements 5.1, 5.2**
+  - [x] 5.8 Write property test for notification channel selection
+    - **Property 32: Notification channel selection**
+    - **Validates: Requirements 13.5, 13.6**
+  - [x] 5.9 Write property test for dispatch resilience
+    - **Property 33: Notification dispatch is resilient**
+    - **Validates: Requirements 13.7**
+
+- [x] 6. Checkpoint — identity, admin config, requests, and matching verified
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [x] 7. Offers with a 1–8 hour hold, expiry, and acceptance
+  - [x] 7.1 Implement Offer creation with validation and gating
+    - Reject a Landed_Price less than or equal to zero and a hold outside the inclusive range 1 to 8 hours; reject submissions from Closed or Pending Supplier Companies; require an Open, in-radius Request; store optional ETA; set `expiresAt = createdAt + holdHours`.
+    - _Requirements: 5.4, 5.5, 6.1, 6.2, 6.3, 6.4, 6.5_
+  - [x] 7.2 Implement offer activeness and the buyer-facing offer list
+    - `isActive` treats an offer as active while now is before `expiresAt` and its status is active, expired at or after `expiresAt`; the buyer list projects supplier name, landed price, ETA, expiry, and the active/expired indicator.
+    - _Requirements: 6.6, 7.1, 7.2, 7.4_
+  - [x] 7.3 Implement offer acceptance and order creation
+    - Owner-only on an Open Request: create an Order at Accepted linking Request, Offer, and winning Supplier Company; set Request_Status to Accepted; void every other active Offer; expose the Order to the winning Supplier as a won order. Reject acceptance of an expired Offer with an expiry error, reject acceptance when the Request is not Open (covering a second accept), and reject acceptance of an Offer owned by a Closed Supplier Company.
+    - _Requirements: 7.3, 8.1, 8.2, 8.3, 8.4, 8.6, 8.7_
+  - [x] 7.4 Wire the NEW_OFFER and ACCEPTED notifications
+    - NEW_OFFER to the owning Buyer on Offer creation; ACCEPTED to the winning Supplier on acceptance.
+    - _Requirements: 13.2, 13.3_
+  - [x] 7.5 Write property test for the Offer round trip and expiry computation
+    - **Property 12: Offer round trip and expiry computation**
+    - **Validates: Requirements 6.1, 6.2, 6.3**
+  - [x] 7.6 Write property test for Offer input validation including the hold bound
+    - **Property 13: Offer input validation including hold bound**
+    - **Validates: Requirements 6.4, 6.5**
+  - [x] 7.7 Write property test for offer submission gating
+    - **Property 11: Offer submission is gated by supplier status and approval**
+    - **Validates: Requirements 5.4, 5.5**
+  - [x] 7.8 Write property test for the offer view fields and activeness indicator
+    - **Property 14: Offer view contains required fields and activeness indicator**
+    - **Validates: Requirements 6.6, 7.4**
+  - [x] 7.9 Write property test for the offer activeness boundary
+    - **Property 15: Offer activeness boundary**
+    - **Validates: Requirements 7.1, 7.2**
+  - [x] 7.10 Write property test for expired-offer acceptance rejection
+    - **Property 16: Expired offers cannot be accepted**
+    - **Validates: Requirements 7.3**
+  - [x] 7.11 Write property test for acceptance exclusivity
+    - **Property 17: Acceptance produces one exclusive, linked, visible order**
+    - **Validates: Requirements 8.1, 8.2, 8.3, 8.7**
+  - [x] 7.12 Write property test for the Open-request precondition on acceptance
+    - **Property 18: Acceptance requires an Open request**
+    - **Validates: Requirements 8.4**
+  - [x] 7.13 Write property test for Closed-supplier offer acceptance rejection
+    - **Property 19: Offers from Closed suppliers cannot be accepted**
+    - **Validates: Requirements 8.6**
+
+- [x] 8. Request cancel and expire
+  - [x] 8.1 Implement buyer cancellation of an Open Request
+    - Owner-only: set Request_Status to Cancelled and void every active Offer on the Request; reject cancellation when the Request is not Open.
+    - _Requirements: 9.1, 9.2, 9.5_
+  - [x] 8.2 Implement window-end expiry
+    - When `windowEndsAt` has passed and the Request is still Open, set Request_Status to Expired and void every remaining active Offer; evaluate lazily on Request read and on matching so Cancelled and Expired Requests never surface in supplier inboxes.
+    - _Requirements: 9.3, 9.4_
+  - [x] 8.3 Write property test for cancellation voiding offers
+    - **Property 20: Cancelling an Open request voids its offers**
+    - **Validates: Requirements 9.1**
+  - [x] 8.4 Write property test for the Open-request precondition on cancellation
+    - **Property 21: Cancellation requires an Open request**
+    - **Validates: Requirements 9.2**
+  - [x] 8.5 Write property test for window-end expiry
+    - **Property 22: Expiry after window end voids remaining offers**
+    - **Validates: Requirements 9.3**
+
+- [x] 9. Order lifecycle, en route, and delivery with BOL
+  - [x] 9.1 Implement the forward-only order state machine
+    - Allow only Accepted, En_Route, and Delivered; advance Accepted to En_Route to Delivered; permit recording a Delivery directly from Accepted; reject any backward change; expose the current status on buyer read.
+    - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6_
+  - [x] 9.2 Implement delivery recording with BOL gallons
+    - Winning-supplier-company only: create at most one Delivery per Order (unique `orderId`), require BOL_Gallons greater than zero and a ticket number, store an optional ticket photo key, set Order_Status to Delivered, and reject a second Delivery on the same Order.
+    - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7_
+  - [x] 9.3 Wire the DELIVERED notification
+    - Send DELIVERED to the owning Buyer when an Order reaches Delivered.
+    - _Requirements: 13.4_
+  - [x] 9.4 Write property test for forward-only status transitions
+    - **Property 23: Order status advances forward-only**
+    - **Validates: Requirements 10.1, 10.2, 10.3, 10.4, 10.5**
+  - [x] 9.5 Write property test for delivery recording and per-order uniqueness
+    - **Property 24: Delivery recording sets Delivered, stores details, and is unique per order**
+    - **Validates: Requirements 11.1, 11.2, 11.3, 11.6**
+  - [x] 9.6 Write property test for delivery input validation
+    - **Property 25: Delivery input validation**
+    - **Validates: Requirements 11.4, 11.5**
+  - [x] 9.7 Write property test for event-to-recipient routing
+    - **Property 31: Marketplace events notify the correct recipients**
+    - **Validates: Requirements 13.1, 13.2, 13.3, 13.4**
+  - [x] 9.8 Write unit test for the buyer order-status read
+    - A buyer reading an Order sees the status produced by the last valid transition.
+    - _Requirements: 10.6_
+
+- [x] 10. Commission invoicing, waived wins, and mark paid
+  - [x] 10.1 Implement commission calculation with the waived-win rule
+    - `commissionAmount(bolGallons, priorCompletedWins)` returns 0 with the waived flag set for a Supplier Company's first two completed wins and BOL_Gallons × $0.02 thereafter.
+    - _Requirements: 12.2, 12.3_
+  - [x] 10.2 Implement invoice generation on delivery
+    - Generate exactly one Commission_Invoice per Delivered Order addressed to the winning Supplier Company, created Unpaid including waived $0 invoices, guarded idempotent by the unique `orderId`; generate nothing for Orders that have not reached Delivered. The entry point is origin-agnostic so the concierge path reuses it unchanged.
+    - _Requirements: 12.1, 12.4, 12.5, 17.3_
+  - [x] 10.3 Implement admin mark-paid and the commission-due report
+    - Admin-only mark-paid persists Payment_Status Paid plus the acting Admin id and timestamp and never reverts to Unpaid; non-Admin attempts are denied; commission due returns Unpaid amounts grouped by Supplier Company.
+    - _Requirements: 12.6, 12.7, 12.8_
+  - [x] 10.4 Write property test for the commission amount
+    - **Property 26: Commission amount depends on prior wins and gallons**
+    - **Validates: Requirements 12.2, 12.3**
+  - [x] 10.5 Write property test for invoice generation
+    - **Property 27: Delivered orders generate exactly one addressed, unpaid invoice**
+    - **Validates: Requirements 12.1, 12.4, 17.3**
+  - [x] 10.6 Write property test for no invoice before delivery
+    - **Property 28: No invoice before delivery**
+    - **Validates: Requirements 12.5**
+  - [x] 10.7 Write property test for admin mark-paid
+    - **Property 29: Admin mark-paid records payment state and never reverts**
+    - **Validates: Requirements 12.6**
+  - [x] 10.8 Write property test for commission-due aggregation
+    - **Property 30: Commission due aggregates unpaid invoices per supplier**
+    - **Validates: Requirements 12.8**
+
+- [x] 11. Checkpoint — full marketplace ledger verified
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [x] 12. Concierge orders, audit log, and the authorization matrix
+  - [x] 12.1 Implement the append-only audit log
+    - `AuditService.append` exposes insert and read only, with no update or delete path; each row carries the acting User where any (nullable for system-driven expiry), the subject entity ids, prior and new values where relevant, and a timestamp.
+    - _Requirements: 14.7_
+  - [x] 12.2 Wire audit entries into every audited action
+    - Append on Offer created, Offer accepted, Request cancelled, Request expired, Order_Status change, Concierge_Order created, and Commission_Invoice marked Paid.
+    - _Requirements: 14.1, 14.2, 14.3, 14.4, 14.5, 14.6_
+  - [x] 12.3 Implement admin concierge order entry
+    - Admin-only: from a Buyer Company, a winning Supplier Company, BOL_Gallons greater than zero, and an optional ticket number, create an Order at Delivered with its Delivery, reuse the shared commission generation including waived wins, and append the concierge audit row; deny non-Admin callers.
+    - _Requirements: 17.1, 17.2, 17.3, 17.4, 17.5_
+  - [x] 12.4 Write property test for audited actions
+    - **Property 34: Audited actions append matching entries**
+    - **Validates: Requirements 14.1, 14.2, 14.3, 14.4, 14.5, 14.6, 17.4**
+  - [x] 12.5 Write property test for the append-only audit log
+    - **Property 35: Audit log is append-only and monotonic**
+    - **Validates: Requirements 14.7**
+  - [x] 12.6 Write property test for role-based authorization enforcement
+    - **Property 36: Role-based authorization is enforced**
+    - **Validates: Requirements 1.9, 8.5, 9.5, 11.7, 12.7, 16.8, 17.5**
+  - [x] 12.7 Write property test for concierge order creation
+    - **Property 39: Concierge order lands as a delivered order**
+    - **Validates: Requirements 17.1, 17.2**
+
+- [x] 13. REST API surface over the service layer
+  - [x] 13.1 Implement the route handlers
+    - Auth, site, request (create, list, cancel), offer (create, list), order (advance, read), delivery, and admin routes (approve, operating location, radius, geofence, concierge, mark paid, commission due) delegating to the services, with the shared `{ error: { code, message, field? } }` shape and the category mapping: validation 400, geofence 422, authentication 401, authorization 403, conflict/state 409.
+    - _Requirements: 1.1, 1.2, 3.1, 3.6, 6.1, 8.1, 9.1, 10.2, 11.1, 12.6, 12.8, 16.2, 16.4, 16.7, 17.1_
+  - [x] 13.2 Wire ticket-photo upload to S3
+    - Store the photo under a key on the Delivery; treat an upload failure as non-fatal so gallons and ticket number still record.
+    - _Requirements: 11.6_
+  - [x] 13.3 Write integration tests for the end-to-end paths
+    - Request inside the geofence to matched suppliers to offer to accept to en route to delivered to invoice to mark paid; the cancel path; the window-expiry path; and the admin concierge path.
+    - _Requirements: 3.1, 4.1, 6.1, 8.1, 9.1, 9.3, 10.2, 11.1, 12.1, 12.6, 17.1_
+  - [x] 13.4 Write unit tests for error-category to HTTP mapping
+    - Representative validation, geofence, authentication, authorization, and conflict cases.
+    - _Requirements: 1.2, 3.5, 3.6, 7.3, 8.4, 8.5_
+
+- [x] 14. PWA field UI for Buyer, Supplier, and Admin
+  - [x] 14.1 Build the Buyer flow
+    - Sign-in, work list of Open Requests and Orders, the single New Request form collecting gallons, Product_Type, Delivery_Method, pin, window, and notes with the device geolocation offered as the default pin, offer list showing supplier, price, ETA, expiry, and active/expired with one-tap Accept, a Cancel action on Open Requests, and the order status view.
+    - Dark high-contrast styling with interactive controls at least 44 by 44 CSS pixels on the New Request form.
+    - _Requirements: 3.1, 3.9, 6.6, 7.4, 8.1, 9.1, 10.6, 15.2, 15.3, 15.4_
+  - [x] 14.2 Build the Supplier flow
+    - Supplier_Status toggle across Open / Limited / Closed, RFQ inbox, quote box taking landed $/gal plus a 1–8 hour hold, won orders, mark en route, and the delivery form with BOL gallons, ticket number, and optional ticket photo.
+    - _Requirements: 5.2, 6.1, 6.2, 10.2, 11.1, 11.6_
+  - [x] 14.3 Build the Admin flow
+    - Approve suppliers, set Operating_Location and Service_Radius, edit the Pilot_Geofence, enter concierge orders, view commission due grouped by Supplier Company, and mark invoices paid.
+    - _Requirements: 12.6, 12.8, 16.2, 16.4, 16.5, 16.7, 17.1_
+  - [x] 14.4 Finalize PWA installability
+    - Web app manifest, service worker, and offline app shell; present the role-appropriate interface on load.
+    - _Requirements: 1.8, 15.1_
+  - [x] 14.5 Write unit tests for the PWA shell and New Request form
+    - Manifest validity and service worker registration; the New Request form renders gallons, product, method, pin, and window inputs; the geolocation default pin with a mocked geolocation source.
+    - _Requirements: 15.1, 15.2, 15.3_
+
+- [ ] 15. Final checkpoint — full two-sided flow integrated
+  - Ensure all tests pass, ask the user if questions arise.
+
+## Notes
+
+- All tasks are required; there are no optional sub-tasks.
+- Task order follows the locked build sequence: identity and roles, admin configuration, request and matching, offers and acceptance, cancel/expire, delivery, commission, concierge and audit, then the PWA UI last.
+- Each of the 39 correctness properties in `design.md` maps to exactly one property-test sub-task, tagged `// Feature: load-energy, Property {n}: {text}` and run with at least 100 iterations of `fast-check`.
+- Unit and integration tests cover the example-only criteria (login, order status read, PWA shell, geolocation pin) and the error-category mapping; the 44×44 touch-target requirement is verified by design review.
+- Checkpoints at tasks 6, 11, and 15 gate incremental validation.
+- Out of scope for v1 and absent from these tasks: native apps, fuel checkout, title transfer, truck GPS, auto-dispatch, ML pricing, gasoline, DEF, cardlock, multi-state tax, supplier-set radius, listings/rack feed, offer withdrawal after submit, a ±5% gallon tolerance engine, and OCR on tickets. License verification remains an offline Admin process against the ADOT supplier list.
+- Do not start a second product surface until 20 Delivered rows exist.

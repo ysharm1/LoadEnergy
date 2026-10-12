@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Load Energy">
+  <rect width="512" height="512" fill="#0b0b0c" />
+  <circle cx="256" cy="256" r="200" fill="#ffb000" />
+  <path
+    d="M256 120c0 0-92 104-92 168a92 92 0 0 0 184 0c0-64-92-168-92-168z"
+    fill="#0b0b0c"
+  />
+  <path d="M256 200c0 0-48 62-48 96a48 48 0 0 0 96 0c0-34-48-96-48-96z" fill="#ffb000" />
+</svg>
