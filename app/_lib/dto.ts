@@ -31,8 +31,17 @@ export interface CompanyDto {
   serviceRadiusMiles: number | null;
 }
 
+/** The User as the API projects it — no password hash, ever. */
+export interface UserDto {
+  id: string;
+  companyId: string;
+  role: Role;
+  phone: string;
+  email: string | null;
+}
+
 export interface SessionDto {
-  user: { id: string; companyId: string; role: Role; phone: string; email: string | null };
+  user: UserDto;
   company: CompanyDto;
   role: Role;
 }

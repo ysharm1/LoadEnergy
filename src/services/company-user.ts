@@ -14,18 +14,45 @@
  * database, no ambient clock. Passwords are hashed through the
  * `PasswordHasher` port before storage — plaintext never reaches the
  * repository.
+ *
+ * ## Two doors, on purpose
+ *
+ * Onboarding is the one marketplace operation that also has to happen before
+ * any Admin exists: a fresh deployment has no Company and no User, so the
+ * first rows are written by a trusted server-side caller (the seed script)
+ * that has no session to be authorized against. Guarding the only creation
+ * path would make bootstrapping impossible, and a "null context means allow"
+ * escape hatch inside the guard would weaken every other action in the matrix.
+ *
+ * So this service exposes the same logic through two entry points:
+ *
+ *   - `createCompany` / `createUser` — unguarded, and reachable only from
+ *     trusted in-process callers (seeding, fixtures). They take no
+ *     `AuthContext` because there is nobody to check; nothing in `src/http` or
+ *     `app/` calls them.
+ *   - `createCompanyAsAdmin` / `createUserAsAdmin` — the guarded entry points,
+ *     Admin-only through `requireAction` (`company.create`, `user.create`).
+ *     These are the *only* methods the HTTP handlers call, so every onboarding
+ *     write that originates from a request is authorized by the same policy
+ *     table as the rest of the marketplace.
+ *
+ * The guard therefore sits on the boundary that can actually be reached by an
+ * untrusted caller, and the authorization matrix keeps one row per decision
+ * (Property 36 exercises both new rows through the guarded methods).
  */
 
 import { ValidationError } from "@/domain/errors";
 import {
   ROLES,
   COMPANY_KINDS,
+  type AuthContext,
   type Company,
   type CompanyKind,
   type Role,
   type User,
 } from "@/domain/types";
 import type { Repository } from "@/repository/repository";
+import { requireAction } from "./authorization";
 import type { PasswordHasher } from "./password";
 
 /**
@@ -144,7 +171,46 @@ export class CompanyUserService {
   }
 
   /**
+   * Creates a Company on an Admin's behalf (Requirement 16.1) — the guarded
+   * entry point behind `POST /api/admin/companies`.
+   *
+   * Admin-only through the `company.create` policy row; a Buyer or Supplier
+   * who finds the route is denied with a 403 before any validation runs, so a
+   * denial writes nothing. See the module note for why the unguarded
+   * `createCompany` still exists.
+   */
+  async createCompanyAsAdmin(
+    ctx: AuthContext | null | undefined,
+    input: CreateCompanyInput,
+    now: Date = new Date()
+  ): Promise<Company> {
+    requireAction(ctx, "company.create");
+    return this.createCompany(input, now);
+  }
+
+  /**
+   * Creates a User on an existing Company on an Admin's behalf
+   * (Requirements 1.3, 1.4) — the guarded entry point behind
+   * `POST /api/admin/users`.
+   *
+   * Admin-only through the `user.create` policy row. Deliberately not
+   * company-scoped: seating a User on a company the Admin does not belong to
+   * is the normal case.
+   */
+  async createUserAsAdmin(
+    ctx: AuthContext | null | undefined,
+    input: CreateUserInput,
+    now: Date = new Date()
+  ): Promise<User> {
+    requireAction(ctx, "user.create");
+    return this.createUser(input, now);
+  }
+
+  /**
    * Creates a Company.
+   *
+   * Trusted callers only (see the module note): no `AuthContext`, no guard.
+   * The HTTP surface goes through `createCompanyAsAdmin`.
    *
    * A Supplier Company starts with Supplier_Approval_Status Pending
    * (Requirement 16.1) and Supplier_Status closed, so it cannot receive RFQs
@@ -191,6 +257,9 @@ export class CompanyUserService {
    * Creates a User linked to exactly one existing Company (Requirement 1.3)
    * with exactly one role (Requirement 1.4), a required E.164 phone
    * (Requirements 1.5, 1.6), and an optional email (Requirement 1.7).
+   *
+   * Trusted callers only (see the module note): no `AuthContext`, no guard.
+   * The HTTP surface goes through `createUserAsAdmin`.
    *
    * The role is persisted on the User row, which is what `AuthContext`
    * resolution reads so the client can present the role-appropriate interface

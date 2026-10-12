@@ -43,7 +43,9 @@ import {
   type AuthorizedAction,
 } from "./authorization";
 import { CommissionService } from "./commission";
+import { CompanyUserService } from "./company-user";
 import { MatchingService } from "./matching";
+import type { PasswordHasher } from "./password";
 import { OfferService } from "./offer";
 import { OrderService } from "./order";
 import { RequestService } from "./request";
@@ -63,6 +65,32 @@ const FENCE: Geofence = {
 const BUCKEYE: LatLng = { lat: 33.3703, lng: -112.5838 };
 /** Generous enough that every in-fence pin is in radius for both suppliers. */
 const SEEDED_RADIUS_MILES = 250;
+
+/**
+ * Outside the block the fixture's seats are drawn from, so the User the
+ * `user.create` row onboards never collides with a seeded phone number.
+ */
+const ONBOARDED_PHONE = "+16025559001";
+const ONBOARDED_PASSWORD = "onboarding-password";
+
+/**
+ * A stand-in for the hashing port, which is the one place a real adapter would
+ * dominate the run: bcrypt's cost factor is deliberate, and `user.create` is
+ * invoked once per iteration. Nothing under test depends on the hash's
+ * strength — only on plaintext never reaching the repository, which this still
+ * shows.
+ */
+class FakePasswordHasher implements PasswordHasher {
+  async hash(password: string): Promise<string> {
+    return `fake-hash:${password}`;
+  }
+  async verify(password: string, hash: string): Promise<boolean> {
+    return hash === `fake-hash:${password}`;
+  }
+  async decoyHash(): Promise<string> {
+    return "fake-hash:decoy";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Callers: role x company relationship to the fixture
@@ -97,6 +125,7 @@ interface Harness {
   suppliers: SupplierService;
   matching: MatchingService;
   commission: CommissionService;
+  companies: CompanyUserService;
   ids: {
     buyerCompany: string;
     otherBuyerCompany: string;
@@ -143,6 +172,10 @@ async function makeHarness(scenario: Scenario): Promise<Harness> {
   const orders = new OrderService({ repo, commission });
   const suppliers = new SupplierService({ repo });
   const matching = new MatchingService({ repo });
+  const companies = new CompanyUserService({
+    repo,
+    hasher: new FakePasswordHasher(),
+  });
 
   let phoneSeq = 0;
   const nextPhone = (): string =>
@@ -267,6 +300,7 @@ async function makeHarness(scenario: Scenario): Promise<Harness> {
     suppliers,
     matching,
     commission,
+    companies,
     ids: {
       buyerCompany: owningBuyer.id,
       otherBuyerCompany: otherBuyer.id,
@@ -424,6 +458,39 @@ const GUARDED_ACTIONS: readonly GuardedAction[] = [
   },
 
   // --- Admin surface (Requirements 12.7, 16.8, 17.5) --------------------
+  /**
+   * Onboarding is Admin-only, and the guarded entry point is the only one the
+   * HTTP surface can reach — see the two-doors note in
+   * `services/company-user.ts`. The unguarded `createCompany`/`createUser`
+   * take no `AuthContext` and so cannot be driven from a seat at all.
+   */
+  {
+    action: "company.create",
+    allow: ["admin"],
+    requirements: "1.9, 16.1",
+    invoke: (h, ctx, s) =>
+      h.companies.createCompanyAsAdmin(
+        ctx,
+        { name: `${s.siteName} Fuel`, kind: "supplier" },
+        NOW
+      ),
+  },
+  {
+    action: "user.create",
+    allow: ["admin"],
+    requirements: "1.3, 1.4, 1.9",
+    invoke: (h, ctx) =>
+      h.companies.createUserAsAdmin(
+        ctx,
+        {
+          companyId: h.ids.otherBuyerCompany,
+          role: "buyer",
+          phone: ONBOARDED_PHONE,
+          password: ONBOARDED_PASSWORD,
+        },
+        NOW
+      ),
+  },
   {
     action: "supplier.approve",
     allow: ["admin"],

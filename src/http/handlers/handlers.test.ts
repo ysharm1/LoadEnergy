@@ -46,7 +46,10 @@ import {
 import {
   approveSupplierHandler,
   commissionDueHandler,
+  createCompanyHandler,
   createConciergeOrderHandler,
+  createUserHandler,
+  listCompaniesHandler,
   markInvoicePaidHandler,
   setGeofenceHandler,
   setOperatingLocationHandler,
@@ -868,6 +871,177 @@ describe("admin routes", () => {
     ]);
 
     for (const response of denied) expect(response.status).toBe(403);
+  });
+
+  it("onboards a company and a user, and the new user can sign in", async () => {
+    const adminCookie = await signIn(h, h.admin.phone);
+
+    // Requirement 16.1 — a new supplier company starts Pending and closed.
+    const createdCompany = await createCompanyHandler(
+      h.services,
+      post(
+        "/api/admin/companies",
+        { name: "Estrella Fuel", kind: "supplier" },
+        adminCookie
+      )
+    );
+    expect(createdCompany.status).toBe(201);
+    const { company } = await bodyOf(createdCompany);
+    expect(company).toMatchObject({
+      name: "Estrella Fuel",
+      kind: "supplier",
+      supplierApprovalStatus: "pending",
+      supplierStatus: "closed",
+    });
+
+    // It shows up on the roster the rest of the Admin surface reads.
+    const roster = await listCompaniesHandler(
+      h.services,
+      get("/api/admin/companies", adminCookie)
+    );
+    const { suppliers } = await bodyOf(roster);
+    expect(suppliers.map((c: any) => c.id)).toContain(company.id);
+
+    // Requirements 1.3, 1.4, 1.7 — one company, one role, optional email.
+    const createdUser = await createUserHandler(
+      h.services,
+      post(
+        "/api/admin/users",
+        {
+          companyId: company.id,
+          role: "supplier",
+          phone: "+1 (602) 555-0144",
+          email: " Dispatch@Estrella.COM ",
+          password: PASSWORD,
+        },
+        adminCookie
+      )
+    );
+    expect(createdUser.status).toBe(201);
+    const { user } = await bodyOf(createdUser);
+    expect(user).toMatchObject({
+      companyId: company.id,
+      role: "supplier",
+      phone: "+16025550144",
+      email: "dispatch@estrella.com",
+    });
+    // The hash never leaves the server.
+    expect(JSON.stringify(user)).not.toContain("passwordHash");
+    expect((await h.repo.getUser(user.id))?.passwordHash).not.toBe(PASSWORD);
+
+    // The whole point of onboarding: the new seat can actually sign in.
+    const signedIn = await loginHandler(
+      h.services,
+      post("/api/auth/login", { identifier: "+16025550144", password: PASSWORD })
+    );
+    expect(signedIn.status).toBe(200);
+    expect((await bodyOf(signedIn)).role).toBe("supplier");
+  });
+
+  it("denies onboarding to a non-admin caller and writes nothing (403)", async () => {
+    const buyerCookie = await signIn(h, h.buyer.phone);
+    const supplierCookie = await signIn(h, h.supplier.phone);
+    const companiesBefore = (await h.repo.listCompanies()).length;
+
+    for (const cookie of [buyerCookie, supplierCookie]) {
+      const company = await createCompanyHandler(
+        h.services,
+        post("/api/admin/companies", { name: "Sneaky Fuel", kind: "supplier" }, cookie)
+      );
+      expect(company.status).toBe(403);
+
+      const user = await createUserHandler(
+        h.services,
+        post(
+          "/api/admin/users",
+          {
+            companyId: h.buyerCompany.id,
+            role: "admin",
+            phone: "+16025550155",
+            password: PASSWORD,
+          },
+          cookie
+        )
+      );
+      expect(user.status).toBe(403);
+    }
+
+    // No self-promotion to admin, and no new company.
+    expect((await h.repo.listCompanies()).length).toBe(companiesBefore);
+    const seats = await h.repo.listUsersByCompany(h.buyerCompany.id);
+    expect(seats.map((seat) => seat.role)).toEqual(["buyer"]);
+  });
+
+  it("rejects onboarding with no session cookie as 401", async () => {
+    const company = await createCompanyHandler(
+      h.services,
+      post("/api/admin/companies", { name: "Nobody Fuel", kind: "buyer" })
+    );
+    expect(company.status).toBe(401);
+
+    const user = await createUserHandler(
+      h.services,
+      post("/api/admin/users", {
+        companyId: h.buyerCompany.id,
+        role: "buyer",
+        phone: "+16025550166",
+        password: PASSWORD,
+      })
+    );
+    expect(user.status).toBe(401);
+  });
+
+  it("maps onboarding validation failures to 400 on the offending field", async () => {
+    const adminCookie = await signIn(h, h.admin.phone);
+
+    const blankName = await createCompanyHandler(
+      h.services,
+      post("/api/admin/companies", { name: "   ", kind: "buyer" }, adminCookie)
+    );
+    expect(blankName.status).toBe(400);
+    expect((await bodyOf(blankName)).error).toMatchObject({
+      code: "COMPANY_NAME_REQUIRED",
+      field: "name",
+    });
+
+    const badKind = await createCompanyHandler(
+      h.services,
+      post("/api/admin/companies", { name: "Hauler Co", kind: "hauler" }, adminCookie)
+    );
+    expect(badKind.status).toBe(400);
+    expect((await bodyOf(badKind)).error.field).toBe("kind");
+
+    // Requirement 1.6 — a missing phone number is a validation error.
+    const noPhone = await createUserHandler(
+      h.services,
+      post(
+        "/api/admin/users",
+        { companyId: h.buyerCompany.id, role: "buyer", password: PASSWORD },
+        adminCookie
+      )
+    );
+    expect(noPhone.status).toBe(400);
+    expect((await bodyOf(noPhone)).error).toMatchObject({
+      code: "PHONE_REQUIRED",
+      field: "phone",
+    });
+
+    // Requirement 1.3 — a User must belong to an existing Company.
+    const noCompany = await createUserHandler(
+      h.services,
+      post(
+        "/api/admin/users",
+        {
+          companyId: "co-does-not-exist",
+          role: "buyer",
+          phone: "+16025550177",
+          password: PASSWORD,
+        },
+        adminCookie
+      )
+    );
+    expect(noCompany.status).toBe(400);
+    expect((await bodyOf(noCompany)).error.field).toBe("companyId");
   });
 
   it("creates a concierge order as a Delivered order with its invoice", async () => {

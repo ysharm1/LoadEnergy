@@ -5,6 +5,17 @@ generator client {
   provider = "prisma-client-js"
 }
 
+// One connection string, deliberately. The deployment target (Render) runs a
+// persistent Node process against a session-mode Postgres endpoint, so the
+// same URL serves both the application's queries and the schema engine's DDL.
+//
+// If a connection pooler is ever put in front of this — pgbouncer in
+// transaction mode, or a serverless provider's pooled endpoint — add
+// `directUrl = env("DIRECT_URL")` here and point it at the *unpooled*
+// endpoint, because a transaction pooler cannot run DDL or hold the advisory
+// locks `prisma migrate` needs. Until then that second variable would be a
+// required input with no benefit: naming it makes it mandatory, and every
+// prisma command fails with P1012 when it is unset.
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")

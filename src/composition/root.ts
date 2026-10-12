@@ -23,6 +23,16 @@
  * ordinary per-channel failure (Requirement 13.7), so a pilot deployment
  * without Twilio or S3 still takes orders — it just logs that it could not
  * page anyone, which is the behaviour the design asks for.
+ *
+ * ## Persistence does not degrade
+ *
+ * The one exception to that rule is the database. `createServicesFromEnv`
+ * picks the in-memory repository and session store when `DATABASE_URL` is
+ * unset, which is what makes `next dev` and the test suite work with nothing
+ * installed — but when `NODE_ENV === "production"` the same gap throws
+ * `MISSING_DATABASE_URL_MESSAGE` instead. A transport that cannot deliver
+ * loses a notification; a repository that forgets loses the ledger, so the
+ * only safe production behaviour is to refuse to start.
  */
 
 import { InMemoryRepository } from "@/repository/in-memory";
@@ -155,6 +165,18 @@ export function createServices(deps: ServiceDeps): Services {
 }
 
 /**
+ * The error a production boot without `DATABASE_URL` fails with. Exported so
+ * the message lives in one place and a test can assert on it.
+ */
+export const MISSING_DATABASE_URL_MESSAGE =
+  "DATABASE_URL is not set. A production deployment must run on Postgres: " +
+  "without it the app would start on the in-memory repository and lose every " +
+  "company, user, request, order and session on the next restart. Set " +
+  "DATABASE_URL (on Render it is wired from the database instance) and " +
+  "redeploy. For local development, leave it unset and the in-memory " +
+  "adapters are used instead.";
+
+/**
  * Builds the production graph from the environment.
  *
  * ## Persistence is chosen by `DATABASE_URL`
@@ -162,13 +184,22 @@ export function createServices(deps: ServiceDeps): Services {
  * With `DATABASE_URL` set, the graph is wired over `PrismaRepository` and
  * `PrismaSessionStore` and the pilot's state outlives the process. With it
  * unset, the in-memory pair is used instead, so `next dev`, a smoke run, and
- * the test suite all work with nothing installed. That is the whole of the
- * switch: because both adapters are held to one behavioural contract
- * (`repository-contract.ts`), nothing downstream can tell which one it got.
+ * the test suite all work with nothing installed. Because both adapters are
+ * held to one behavioural contract (`repository-contract.ts`), nothing
+ * downstream can tell which one it got.
  *
- * The environment variable is the gate rather than `NODE_ENV` deliberately —
- * "is a database reachable" is the question that actually matters, and it is
- * the same question in development, CI, and production.
+ * ## Except in production, where there is no fallback
+ *
+ * That silence is a virtue in development and a trap on a hosted deploy: an
+ * instance with no `DATABASE_URL` would boot, serve, accept orders, and drop
+ * all of it on the next restart or route a second instance to a different
+ * copy of reality. So when `NODE_ENV === "production"` and `DATABASE_URL` is
+ * absent, this throws instead of falling back. A deploy that cannot persist
+ * should fail loudly at boot, not quietly at 2am.
+ *
+ * Outside production the fallback is unchanged: `next dev` and the test suite
+ * depend on it, and "is a database reachable" remains the only question asked
+ * there.
  *
  * Sessions move with the repository rather than staying in-process. Leaving
  * them in a map while rows went to Postgres would mean a redeploy silently
@@ -176,6 +207,10 @@ export function createServices(deps: ServiceDeps): Services {
  * them at all; the `Session` table already exists for exactly this.
  */
 export function createServicesFromEnv(): Services {
+  if (!isDatabaseConfigured() && process.env.NODE_ENV === "production") {
+    throw new Error(MISSING_DATABASE_URL_MESSAGE);
+  }
+
   const prisma = isDatabaseConfigured() ? getPrismaClient() : null;
 
   return createServices({

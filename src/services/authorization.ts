@@ -250,6 +250,8 @@ export const AUTHORIZED_ACTIONS = [
   // Shared
   "order.read",
   // Admin surface
+  "company.create",
+  "user.create",
   "supplier.approve",
   "supplier.setOperatingLocation",
   "supplier.setServiceRadius",
@@ -344,6 +346,26 @@ export const ACTION_POLICIES: Record<AuthorizedAction, ActionPolicy> = {
   },
 
   // --- Admin (never company-scoped) --------------------------------------
+  /**
+   * Onboarding a trading company. Not company-scoped: the company does not
+   * exist yet, so there is no owning company to check against — the authority
+   * is the Admin role alone.
+   */
+  "company.create": {
+    roles: ["admin"],
+    scope: "none",
+    requirements: ["1.3", "16.1"],
+  },
+  /**
+   * Onboarding a User onto an existing Company. Not company-scoped either: an
+   * Admin seats users on companies they do not belong to, which is the whole
+   * point, so `ctx.companyId` is not the target's owner.
+   */
+  "user.create": {
+    roles: ["admin"],
+    scope: "none",
+    requirements: ["1.3", "1.4"],
+  },
   "supplier.approve": {
     roles: ["admin"],
     scope: "none",
@@ -464,6 +486,8 @@ const ROLE_NAVIGATION: Record<Role, readonly NavigationItem[]> = {
   ],
   admin: [
     { id: "suppliers", label: "Suppliers", path: "/admin/suppliers" },
+    { id: "companies", label: "New company", path: "/admin/companies" },
+    { id: "users", label: "New user", path: "/admin/users" },
     { id: "geofence", label: "Pilot geofence", path: "/admin/geofence" },
     { id: "concierge", label: "Concierge order", path: "/admin/concierge" },
     { id: "commission", label: "Commission due", path: "/admin/commission" },

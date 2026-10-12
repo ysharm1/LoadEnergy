@@ -1,6 +1,9 @@
 /**
- * Admin routes (Requirements 12.6, 12.8, 16.2, 16.4, 16.5, 16.7, 17.1).
+ * Admin routes (Requirements 1.3-1.7, 12.6, 12.8, 16.1, 16.2, 16.4, 16.5,
+ * 16.7, 17.1).
  *
+ *   POST /api/admin/companies                          onboard a company
+ *   POST /api/admin/users                              onboard a user
  *   POST /api/admin/suppliers/{id}/approve             approve a supplier
  *   PUT  /api/admin/suppliers/{id}/operating-location  set the match origin
  *   PUT  /api/admin/suppliers/{id}/service-radius      set the match radius
@@ -17,9 +20,11 @@
  */
 
 import type { Services } from "@/composition/root";
+import type { CompanyKind, Role } from "@/domain/types";
 import { requireAuth } from "../auth-context";
 import { numberField, readJsonObject, stringField } from "../request";
 import { handle, json } from "../respond";
+import { toPublicCompany, toPublicUser } from "./auth";
 
 /** `POST /api/admin/suppliers/{companyId}/approve` (Requirement 16.2). */
 export function approveSupplierHandler(
@@ -160,6 +165,64 @@ export function listCompaniesHandler(
     const ctx = await requireAuth(request, services.auth);
     const companies = await services.admin.listCompanies(ctx);
     return json(companies);
+  });
+}
+
+/**
+ * `POST /api/admin/companies` — onboard a Buyer or Supplier Company
+ * (Requirement 16.1).
+ *
+ * Admin-only inside the service through the `company.create` policy row. The
+ * response is the same projection the login route returns, so nothing beyond
+ * the client-visible company fields leaves the server.
+ */
+export function createCompanyHandler(
+  services: Services,
+  request: Request
+): Promise<Response> {
+  return handle(async () => {
+    const ctx = await requireAuth(request, services.auth);
+    const body = await readJsonObject(request);
+
+    const company = await services.users.createCompanyAsAdmin(ctx, {
+      name: stringField(body.name) as string,
+      kind: stringField(body.kind) as CompanyKind,
+    });
+
+    return json({ company: toPublicCompany(company) }, 201);
+  });
+}
+
+/**
+ * `POST /api/admin/users` — onboard a User onto an existing Company
+ * (Requirements 1.3-1.7).
+ *
+ * Admin-only inside the service through the `user.create` policy row. The
+ * owning company comes from the body here, unlike the Buyer and Supplier
+ * routes, because seating a User on another company *is* the Admin's job —
+ * what still never comes from the body is the caller, which is resolved from
+ * the session cookie alone.
+ *
+ * The response is `toPublicUser`, so the stored `passwordHash` never leaves
+ * the server.
+ */
+export function createUserHandler(
+  services: Services,
+  request: Request
+): Promise<Response> {
+  return handle(async () => {
+    const ctx = await requireAuth(request, services.auth);
+    const body = await readJsonObject(request);
+
+    const user = await services.users.createUserAsAdmin(ctx, {
+      companyId: stringField(body.companyId) as string,
+      role: stringField(body.role) as Role,
+      phone: stringField(body.phone) as string,
+      email: stringField(body.email) ?? null,
+      password: stringField(body.password) as string,
+    });
+
+    return json({ user: toPublicUser(user) }, 201);
   });
 }
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { ValidationError } from "@/domain/errors";
+import { AuthorizationError, ValidationError } from "@/domain/errors";
+import type { AuthContext, Role } from "@/domain/types";
 import { InMemoryRepository } from "@/repository/in-memory";
 import {
   CompanyUserService,
@@ -225,6 +226,104 @@ describe("createUser", () => {
     await expect(
       service.createUser({ ...base, companyId: "company-does-not-exist" }, NOW)
     ).rejects.toMatchObject({ category: "validation", field: "companyId" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The guarded onboarding entry points (Requirements 1.3, 1.4, 1.9, 16.1)
+// ---------------------------------------------------------------------------
+
+describe("createCompanyAsAdmin / createUserAsAdmin (Requirement 1.9)", () => {
+  const ctxFor = (role: Role): AuthContext => ({
+    userId: `user-${role}`,
+    companyId: "co-operator",
+    role,
+  });
+
+  it("creates a company for an Admin, with the same result as the trusted path", async () => {
+    const { service } = makeService();
+
+    const company = await service.createCompanyAsAdmin(
+      ctxFor("admin"),
+      { name: "Buckeye Diesel", kind: "supplier" },
+      NOW
+    );
+
+    // Requirement 16.1 — a new supplier is Pending and closed.
+    expect(company).toMatchObject({
+      name: "Buckeye Diesel",
+      kind: "supplier",
+      supplierApprovalStatus: "pending",
+      supplierStatus: "closed",
+      createdAt: NOW,
+    });
+  });
+
+  it("creates a user on another company for an Admin (Requirements 1.3, 1.4)", async () => {
+    const { service } = makeService();
+    const company = await service.createCompany(
+      { name: "SW Valley Concrete", kind: "buyer" },
+      NOW
+    );
+
+    const user = await service.createUserAsAdmin(
+      ctxFor("admin"),
+      {
+        companyId: company.id,
+        role: "buyer",
+        phone: "+1 (602) 555-0134",
+        password: "pw",
+      },
+      NOW
+    );
+
+    expect(user).toMatchObject({
+      companyId: company.id,
+      role: "buyer",
+      phone: "+16025550134",
+      email: null,
+    });
+    expect(user.passwordHash).not.toBe("pw");
+  });
+
+  it("denies a Buyer, a Supplier, and an unauthenticated caller, writing nothing", async () => {
+    const { repo, service } = makeService();
+    const company = await service.createCompany(
+      { name: "SW Valley Concrete", kind: "buyer" },
+      NOW
+    );
+    const before = (await repo.listCompanies()).length;
+
+    for (const ctx of [ctxFor("buyer"), ctxFor("supplier"), null]) {
+      await expect(
+        service.createCompanyAsAdmin(ctx, { name: "Sneaky Fuel", kind: "supplier" }, NOW)
+      ).rejects.toMatchObject({ category: "authorization", httpStatus: 403 });
+
+      await expect(
+        service.createUserAsAdmin(
+          ctx,
+          {
+            companyId: company.id,
+            role: "admin",
+            phone: "+16025550199",
+            password: "pw",
+          },
+          NOW
+        )
+      ).rejects.toMatchObject({ category: "authorization", httpStatus: 403 });
+    }
+
+    // A denial decides nothing, so it writes nothing.
+    expect((await repo.listCompanies()).length).toBe(before);
+    expect(await repo.listUsersByCompany(company.id)).toHaveLength(0);
+  });
+
+  it("denies before validating, so a malformed input still reads as a denial", async () => {
+    const { service } = makeService();
+
+    await expect(
+      service.createCompanyAsAdmin(ctxFor("buyer"), { name: "", kind: "buyer" }, NOW)
+    ).rejects.toBeInstanceOf(AuthorizationError);
   });
 });
 

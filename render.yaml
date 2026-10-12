@@ -1,0 +1,95 @@
+# Render Blueprint — Load Energy
+#
+# Creates a persistent Node web service plus a managed Postgres instance and
+# wires the connection string from one to the other. Commit this file, then in
+# the Render dashboard: New > Blueprint, pick this repo, and Render reads it
+# from here. Subsequent pushes to `branch` redeploy automatically.
+#
+# Two things are worth knowing before the first deploy:
+#
+#   1. Migrations run in the build command (`prisma migrate deploy`), so the
+#      schema is in place before the new instance starts serving. The baseline
+#      migration lives in prisma/migrations/, which is what makes that command
+#      meaningful — `migrate deploy` applies committed migrations and never
+#      invents any, so it is safe to run on every deploy.
+#   2. Nothing seeds identity. After the first successful deploy, open the
+#      service's Shell tab and run `npm run seed` once to create the first
+#      operator company and admin user (see README).
+#
+# `preDeployCommand` is Render's purpose-built slot for migrations on paid
+# instance types and is the better home for step 1 if you want build artifacts
+# and schema changes separated; it is left out here so a single build command
+# describes the whole pipeline.
+
+databases:
+  - name: load-energy-db
+    databaseName: load_energy
+    user: load_energy
+    # `free` also works for a trial, but Render deletes a free database after
+    # 30 days — not somewhere to keep a pilot's ledger.
+    plan: basic-256mb
+    postgresMajorVersion: "16"
+    region: oregon
+    ipAllowList: [] # Reachable only from inside Render's network.
+
+services:
+  - type: web
+    name: load-energy
+    runtime: node
+    plan: starter
+    region: oregon # Must match the database's region.
+    branch: main
+    autoDeploy: true
+
+    # `npm ci` installs exactly what package-lock.json pins. `--include=dev`
+    # is not optional: NODE_ENV=production (below) applies to the build too,
+    # and without the flag npm would skip devDependencies and `next build`
+    # would fail on a missing typescript. `prisma generate` runs on its own as
+    # the package's postinstall hook.
+    buildCommand: npm ci --include=dev && npx prisma migrate deploy && npm run build
+
+    # `next start`. Next binds the PORT Render injects; nothing in this repo
+    # hardcodes a port, so there is no --port to pass.
+    startCommand: npm start
+
+    # Unauthenticated, no database read, fixed body — see app/api/health.
+    healthCheckPath: /api/health
+
+    envVars:
+      # What the application runs on.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: load-energy-db
+          property: connectionString
+
+      # One connection string covers both the app's queries and
+      # `prisma migrate deploy`, because Render's Postgres is a direct
+      # session-mode endpoint with no pooler in front. If you ever add one,
+      # see the note in prisma/schema.prisma about `directUrl`.
+
+      # Also the switch that makes a missing DATABASE_URL fatal at boot
+      # instead of silently falling back to in-memory storage.
+      - key: NODE_ENV
+        value: production
+
+      - key: NODE_VERSION
+        value: "22.20.0"
+
+      # Credentials for the one-time bootstrap seed. Render prompts for these
+      # when the blueprint is created and never syncs them back to the repo.
+      # They are read by `npm run seed` from the service's own environment, so
+      # the password is never typed into a shell history.
+      - key: SEED_ADMIN_PHONE
+        sync: false
+      - key: SEED_ADMIN_PASSWORD
+        sync: false
+
+      # Optional transports. The app boots and takes orders without them — a
+      # missing SMS/email/photo transport is recorded as a per-notification
+      # failure, by design (Requirement 13.7) — so they are left out of the
+      # blueprint rather than blocking the first deploy on credentials you may
+      # not have yet. Add them in the dashboard (Environment tab) when ready:
+      #
+      #   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER
+      #   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM
+      #   S3_TICKET_BUCKET, AWS_REGION (plus AWS credentials), S3_ENDPOINT
